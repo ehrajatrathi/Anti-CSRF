@@ -1,0 +1,10 @@
+HTTP/1.1 200 OK
+Set-Cookie: csrftoken=COOKIE-ONLY-TOKEN; Path=/; SameSite=Lax
+
+<html><body>
+<form method="POST" action="/vuln/cookie_only">
+  <input type="hidden" name="foo" value="bar"/>
+</form>
+</body></html>
+
+
