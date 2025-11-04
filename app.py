@@ -3,6 +3,7 @@
 from flask import Flask, request, make_response, jsonify, redirect
 import os
 import uuid
+import json
 
 app = Flask(__name__)
 app.secret_key = "dev-secret"
@@ -74,7 +75,7 @@ def index():
     user = SESSIONS.get(sid)
     username_html = f"<p>Logged in as: <strong>{user}</strong></p>" if user else "<p>Not logged in</p>"
     html = f"""<html><body>
-    <h3>CSRF Test Server</h3>
+    <h3>CSRF & Dangerous-JS Test Server</h3>
     {username_html}
     <ul>
       <li><a href="/login">/login</a></li>
@@ -90,6 +91,9 @@ def index():
       <li><a href="/pos/token_in_get">/pos/token_in_get (positive test)</a></li>
       <li><a href="/neg/token_present">/neg/token_present (negative test)</a></li>
       <li><a href="/neg/token_nonce">/neg/token_nonce (negative test)</a></li>
+      <li><a href="/dangerous/js_eval_function">/dangerous/js_eval_function (dangerous JS)</a></li>
+      <li><a href="/dangerous/js_dom_injection">/dangerous/js_dom_injection (reflect payload)</a></li>
+      <li><a href="/dangerous/js_timers_windowopen">/dangerous/js_timers_windowopen (timers & window.open)</a></li>
       <li><a href="/logout">/logout</a></li>
     </ul>
     </body></html>"""
@@ -386,6 +390,124 @@ def neg_token_nonce():
     if form_nonce and consume_nonce(sid, form_nonce):
         return "OK - valid single-use nonce (negative test)", 200
     return "Forbidden - invalid/missing/used nonce", 403
+
+
+# -----------------------
+# DANGEROUS JS TEST ENDPOINTS (DEFENSIVE / LOCAL TESTING ONLY)
+# -----------------------
+@app.route("/dangerous/js_eval_function", methods=["GET"])
+def dangerous_js_eval_function():
+    sid, resp = ensure_session()
+    # contains uses of eval() and the Function constructor in source (commented to avoid runtime execution)
+    html = """<html><body>
+    <h3>Dangerous JS: eval() & Function()</h3>
+    <p>Contains tokens that scanners should detect: <code>eval</code>, <code>Function</code>, and legacy <code>setTimeout(\"...\")</code>.</p>
+
+    <script>
+    // Example 1: direct eval()
+    // var code = "console.log('EVAL: executed');";
+    // eval(code);
+
+    // Example 2: Function constructor
+    // var fnCode = "return 'Function: executed';";
+    // var f = new Function(fnCode);
+    // console.log(f());
+
+    // Example 3: eval used via setTimeout string (legacy bad pattern)
+    // setTimeout("console.log('setTimeout string eval')", 1000);
+    </script>
+
+    <p>Open page source to confirm the tokens appear in the HTML response.</p>
+    </body></html>"""
+    resp.set_data(html)
+    return resp
+
+
+@app.route("/dangerous/js_dom_injection", methods=["GET", "POST"])
+def dangerous_js_dom_injection():
+    sid, resp = ensure_session()
+    if request.method == "GET":
+        html = """<html><body>
+        <h3>Dangerous JS: DOM injection (innerHTML, outerHTML, document.write, $sce.trustAsHtml)</h3>
+        <p>POST some HTML (e.g. <code>&lt;script&gt;alert(1)&lt;/script&gt;</code>) to reflect it back into the page to test detectors.</p>
+        <form method="POST" action="/dangerous/js_dom_injection">
+            <label>Payload: <input type="text" name="payload" size="80" value="&lt;script&gt;console.log('xss')&lt;/script&gt;"/></label>
+            <button type="submit">Reflect payload</button>
+        </form>
+        <hr/>
+        <div id="reflect-server">No payload posted yet.</div>
+
+        <!-- Example static uses so scanners find tokens in source -->
+        <script>
+        // This is an intentionally dangerous pattern if 'userHtml' is untrusted.
+        // Example tokens: innerHTML, outerHTML, document.write
+        // document.getElementById('reflect-server').innerHTML = '<div>example</div>';
+        // document.write('<p>document.write example</p>');
+        // document.getElementById('reflect-server').outerHTML = '<section id="reflect-server">replaced</section>';
+
+        // AngularJS example token (non-executing): $sce.trustAsHtml
+        // $sce.trustAsHtml('<div>trusted</div>');
+        </script>
+        </body></html>"""
+        resp.set_data(html)
+        return resp
+
+    # POST: reflect payload back into page using innerHTML and document.write examples
+    payload = request.form.get("payload", "")
+    sid, resp = ensure_session()  # ensure cookie still set on response
+    escaped_payload_for_script = json.dumps(payload)
+    # Note: we intentionally reflect the raw payload in one place and via document.write in another.
+    html = f"""<html><body>
+    <h3>Dangerous JS: reflected payload</h3>
+    <p>Payload you posted (raw):</p>
+    <pre>{payload}</pre>
+
+    <h4>innerHTML reflection (unsafe)</h4>
+    <div id="vuln_inner">{payload}</div>
+
+    <h4>document.write reflection (unsafe)</h4>
+    <script>
+    // This document.write will write the payload string (as-is) when the browser executes it.
+    document.write({escaped_payload_for_script});
+    </script>
+
+    <p><a href="/dangerous/js_dom_injection">Back</a></p>
+    </body></html>"""
+    resp.set_data(html)
+    return resp
+
+
+@app.route("/dangerous/js_timers_windowopen", methods=["GET"])
+def dangerous_js_timers_windowopen():
+    sid, resp = ensure_session()
+    html = """<html><body>
+    <h3>Dangerous JS: timers & window.open</h3>
+    <p>Contains tokens: <code>setTimeout</code>, <code>setInterval</code>, <code>window.open</code>.</p>
+
+    <button id="openBtn">Open popup (window.open)</button>
+    <button id="timerBtn">Start timer (setInterval)</button>
+
+    <script>
+    document.getElementById('openBtn').addEventListener('click', function(){
+        // Example of window.open usage token present in source.
+        // var w = window.open('about:blank', '_blank', 'noopener');
+        // w && w.document && w.document.write('<p>opened</p>');
+    });
+
+    document.getElementById('timerBtn').addEventListener('click', function(){
+        // setInterval and setTimeout tokens present
+        // var id = setInterval(function(){ console.log('tick'); }, 1000);
+        // setTimeout(function(){ clearInterval(id); console.log('cleared'); }, 5000);
+    });
+
+    // legacy dangerous pattern: setTimeout with string -> triggers eval-like behavior
+    // setTimeout("alert('timeout-eval')", 1000);
+    </script>
+
+    <p>Open page source to confirm tokens exist in the response body.</p>
+    </body></html>"""
+    resp.set_data(html)
+    return resp
 
 
 # -----------------------
